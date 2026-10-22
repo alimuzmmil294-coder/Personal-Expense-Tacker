@@ -1,6 +1,6 @@
 """
 Personal Expense Tracker
-Built with Streamlit, SQLite (embedded local persistence), and Google Gemini (google-genai).
+Built with Streamlit, SQLite (embedded local persistence), and Google Gemini (google-generativeai).
 """
 
 from __future__ import annotations
@@ -27,6 +27,10 @@ logger = logging.getLogger("ExpenseTracker")
 # ==============================================================================
 
 DB_FILE_PATH: str = os.getenv("EXPENSE_DB_PATH", "expenses.db")
+
+# Fallback to your provided key if not set in secrets or env
+FALLBACK_API_KEY: str = "AQ.Ab8RN6JLg2ey3PkKWwwayYj62BDUu9aMAY0GNZZ2gA8eUFSgBA"
+
 DEFAULT_CURRENCY: str = (
     st.secrets.get("APP_DEFAULT_CURRENCY")
     if hasattr(st, "secrets") and "APP_DEFAULT_CURRENCY" in st.secrets
@@ -42,7 +46,7 @@ ENABLE_AI_FEATURES: bool = str(
 GEMINI_API_KEY: Optional[str] = (
     st.secrets.get("GEMINI_API_KEY")
     if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets
-    else os.getenv("GEMINI_API_KEY")
+    else os.getenv("GEMINI_API_KEY", FALLBACK_API_KEY)
 )
 
 SUPPORTED_CATEGORIES: List[str] = [
@@ -113,17 +117,6 @@ class SQLiteDatabaseService:
             )
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
-
-    @classmethod
-    def get_by_id(cls, user_id: str, expense_id: str) -> Optional[Dict[str, Any]]:
-        with cls.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM expenses WHERE id = ? AND user_id = ?",
-                (expense_id, user_id),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
 
     @classmethod
     def create(cls, user_id: str, data: Dict[str, Any]) -> str:
@@ -200,12 +193,12 @@ class SQLiteDatabaseService:
 
 
 # ==============================================================================
-# 3. AI INTEGRATION LAYER (GOOGLE GENAI SDK)
+# 3. AI INTEGRATION LAYER (GOOGLE GENERATIVE AI SDK)
 # ==============================================================================
 
 
 class GeminiAnalyticsService:
-    """Generates spending insights via Google Gen AI SDK without sending PII."""
+    """Generates spending insights via Google Generative AI SDK without sending personal notes."""
 
     @staticmethod
     def generate_spending_insights(
@@ -224,11 +217,14 @@ class GeminiAnalyticsService:
             return "No transactions found. Add some expenses first to analyze your spending."
 
         try:
-            from google import genai
+            import google.generativeai as genai
 
-            client = genai.Client(api_key=GEMINI_API_KEY)
+            # Configure API key
+            genai.configure(api_key=GEMINI_API_KEY)
 
-            # Strict privacy preservation: transmit only aggregated sums
+            # Standard flash model
+            model = genai.GenerativeModel("gemini-1.5-flash")
+
             prompt = f"""
 You are an expert personal finance budgeting analyst.
 Review the following aggregated spending summary and generate 3 to 4 concise, actionable insights or recommendations.
@@ -242,10 +238,7 @@ Summary Data:
 
 Format with markdown bullet points. Highlight anomalies or dominant expense categories.
 """
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
+            response = model.generate_content(prompt)
             return response.text or "No response received from the AI model."
         except Exception as err:
             logger.error(f"Gemini API request failed: {err}")
@@ -285,7 +278,7 @@ def main() -> None:
         layout="wide",
     )
 
-    # Initialize SQLite Database
+    # Initialize SQLite Database table
     SQLiteDatabaseService.initialize_db()
     init_session_state()
 
@@ -369,13 +362,11 @@ def main() -> None:
             submitted = st.form_submit_button(submit_label, type="primary")
 
             if submitted:
-                # Validation: Title
                 clean_title = title_input.strip()
                 if not clean_title:
                     st.error("Expense title cannot be empty.")
                     st.stop()
 
-                # Validation: Exact Numeric & Positive Check
                 try:
                     dec_amt = Decimal(amount_input.strip())
                     if dec_amt <= Decimal("0"):
