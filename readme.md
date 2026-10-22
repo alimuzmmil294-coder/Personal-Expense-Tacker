@@ -1,33 +1,34 @@
-# Personal Expense Tracker (Streamlit Edition)
+# Personal Expense Tracker (Streamlit + SQLite + Gemini)
 
-A cloud-persisted personal expense management application built with **Python**, **Streamlit**, **Firebase Cloud Firestore**, and the **Google Gemini API (`google-genai`)**.
-
-Designed specifically for single-click deployment on **Streamlit Community Cloud** or local execution.
+A cloud-ready personal finance tracker built with **Python**, **Streamlit**, an embedded **SQLite** database (no external Firebase setup required), and the **Google Gemini API (`google-genai`)**.
 
 ---
 
-## Architecture Overview
+## Key Features
 
-- **UI Framework:** Streamlit (`st.session_state` reactive architecture).
-- **Persistence:** Firebase Cloud Firestore via the official `firebase-admin` SDK.
-- **AI Intelligence:** Google Gemini (`gemini-2.5-flash`) via the `google-genai` SDK.
-- **Security & Privacy:** Database credentials run purely server-side; prompt payloads are stripped of personal transaction titles and individual notes, sending only aggregated numbers.
+- **Zero-Cloud Database Setup:** Uses a self-contained local SQLite database with automatic schema migrations.
+- **Full Reactive CRUD Operations:** Create, review, update, and delete expenses directly within Streamlit.
+- **Financial Precision:** Input amounts are validated using `decimal.Decimal` to avoid floating-point errors.
+- **Configurable Default Currency:** Defaults to `PKR`, configurable via `.env` or Streamlit Secrets.
+- **Dynamic Search & Filtering:** Filter expenses by title, notes, and category, with multi-option sorting.
+- **Two-Step Deletion Guard:** Prevents accidental record loss with an inline confirmation modal.
+- **AI-Powered Spending Summaries:** Evaluates aggregated category trends via `gemini-2.5-flash` without transmitting personal transaction notes.
 
 ---
 
 ## Prerequisites
 
-- Python 3.11 or higher.
-- A Firebase Project with Cloud Firestore enabled in Native Mode.
-- A Google Gemini API Key from Google AI Studio.
+- **Python:** 3.11+
+- **Google Gemini API Key:** Obtainable from [Google AI Studio](https://aistudio.google.com/).
 
 ---
 
-## Local Setup
+## Project Structure
 
-### 1. Clone & Set Up Virtual Environment
-
-**Windows PowerShell:**
-```powershell
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+```text
+expense-tracker/
+├── app.py              # Streamlit application, SQLite persistence, and UI logic
+├── requirements.txt    # Direct dependencies
+├── .env.example        # Environment variable template
+├── .env                # Local secrets (ignored by Git)
+└── README.md           # Documentation and runbook
