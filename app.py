@@ -1,6 +1,6 @@
 """
 Personal Expense Tracker
-Built with Streamlit, Cloud Firestore (Firebase Admin SDK), and Google Gemini (google-genai).
+Built with Streamlit, SQLite (embedded local persistence), and Google Gemini (google-genai).
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 import json
 import logging
 import os
+import sqlite3
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
@@ -25,6 +26,25 @@ logger = logging.getLogger("ExpenseTracker")
 # 1. CONFIGURATION & CONSTANTS
 # ==============================================================================
 
+DB_FILE_PATH: str = os.getenv("EXPENSE_DB_PATH", "expenses.db")
+DEFAULT_CURRENCY: str = (
+    st.secrets.get("APP_DEFAULT_CURRENCY")
+    if hasattr(st, "secrets") and "APP_DEFAULT_CURRENCY" in st.secrets
+    else os.getenv("APP_DEFAULT_CURRENCY", "PKR")
+)
+
+ENABLE_AI_FEATURES: bool = str(
+    st.secrets.get("ENABLE_AI_FEATURES")
+    if hasattr(st, "secrets") and "ENABLE_AI_FEATURES" in st.secrets
+    else os.getenv("ENABLE_AI_FEATURES", "true")
+).lower() == "true"
+
+GEMINI_API_KEY: Optional[str] = (
+    st.secrets.get("GEMINI_API_KEY")
+    if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets
+    else os.getenv("GEMINI_API_KEY")
+)
+
 SUPPORTED_CATEGORIES: List[str] = [
     "Food",
     "Transport",
@@ -37,116 +57,146 @@ SUPPORTED_CATEGORIES: List[str] = [
 
 PAYMENT_METHODS: List[str] = ["Cash", "Card", "Bank Transfer"]
 
-# Streamlit secrets or OS environment variable fallback
-DEFAULT_CURRENCY: str = (
-    st.secrets.get("APP_DEFAULT_CURRENCY")
-    or os.getenv("APP_DEFAULT_CURRENCY", "PKR")
-)
-
-ENABLE_AI_FEATURES: bool = str(
-    st.secrets.get("ENABLE_AI_FEATURES")
-    or os.getenv("ENABLE_AI_FEATURES", "true")
-).lower() == "true"
-
-GEMINI_API_KEY: Optional[str] = (
-    st.secrets.get("GEMINI_API_KEY")
-    or os.getenv("GEMINI_API_KEY")
-)
-
-FIREBASE_CREDENTIALS_PATH: Optional[str] = (
-    st.secrets.get("FIREBASE_CREDENTIALS_PATH")
-    or os.getenv("FIREBASE_CREDENTIALS_PATH")
-)
-
 # ==============================================================================
-# 2. FIREBASE FIRESTORE DATA PERSISTENCE LAYER
+# 2. SQLITE DATA PERSISTENCE LAYER
 # ==============================================================================
 
 
-@st.cache_resource
-def get_firestore_client():
-    """Initializes and returns the Firestore client singleton via Firebase Admin SDK."""
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-
-        if not firebase_admin._apps:
-            cred = None
-
-            # 1. Check Streamlit secrets for parsed dictionary credentials
-            if "firebase_service_account" in st.secrets:
-                cred_dict = dict(st.secrets["firebase_service_account"])
-                cred = credentials.Certificate(cred_dict)
-            # 2. Check JSON string in environment variable
-            elif os.getenv("FIREBASE_CREDENTIALS_JSON"):
-                cred_dict = json.loads(os.getenv("FIREBASE_CREDENTIALS_JSON", "{}"))
-                cred = credentials.Certificate(cred_dict)
-            # 3. Check JSON file path
-            elif FIREBASE_CREDENTIALS_PATH and os.path.exists(FIREBASE_CREDENTIALS_PATH):
-                cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
-            else:
-                logger.warning("No explicit Firebase credentials found; using Application Default.")
-                cred = credentials.ApplicationDefault()
-
-            firebase_admin.initialize_app(cred)
-
-        db = firestore.client()
-        logger.info("Firestore client initialized successfully.")
-        return db
-    except Exception as e:
-        logger.error(f"Failed to initialize Firebase Admin SDK: {e}")
-        return None
-
-
-class FirestoreService:
-    """Encapsulates all database operations for isolated user expense collections."""
+class SQLiteDatabaseService:
+    """Encapsulates thread-safe, local, zero-credential SQLite database operations."""
 
     @staticmethod
-    def _collection(user_id: str):
-        db = get_firestore_client()
-        if db is None:
-            raise RuntimeError(
-                "Database connection unavailable. Verify your Firebase service account configuration."
+    def get_connection() -> sqlite3.Connection:
+        conn = sqlite3.connect(DB_FILE_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @classmethod
+    def initialize_db(cls) -> None:
+        """Creates the expenses table and indexes if they do not exist."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    currency TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    transaction_date TEXT NOT NULL,
+                    payment_method TEXT NOT NULL,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
             )
-        return db.collection("users").document(user_id).collection("expenses")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_date ON expenses (user_id, transaction_date DESC)"
+            )
+            conn.commit()
+            logger.info("SQLite database schema verified successfully.")
 
     @classmethod
     def get_all(cls, user_id: str) -> List[Dict[str, Any]]:
-        collection = cls._collection(user_id)
-        docs = collection.order_by("transaction_date", direction="DESCENDING").stream()
-        records = []
-        for doc in docs:
-            data = doc.to_dict()
-            data["id"] = doc.id
-            records.append(data)
-        return records
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM expenses
+                WHERE user_id = ?
+                ORDER BY transaction_date DESC, created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    @classmethod
+    def get_by_id(cls, user_id: str, expense_id: str) -> Optional[Dict[str, Any]]:
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM expenses WHERE id = ? AND user_id = ?",
+                (expense_id, user_id),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
 
     @classmethod
     def create(cls, user_id: str, data: Dict[str, Any]) -> str:
-        collection = cls._collection(user_id)
+        import uuid
+
+        doc_id = str(uuid.uuid4())
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        data["created_at"] = now
-        data["updated_at"] = now
-        doc_ref = collection.document()
-        doc_ref.set(data)
-        return doc_ref.id
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO expenses (
+                    id, user_id, title, amount, currency, category,
+                    transaction_date, payment_method, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    doc_id,
+                    user_id,
+                    data["title"],
+                    float(data["amount"]),
+                    data["currency"],
+                    data["category"],
+                    data["transaction_date"],
+                    data["payment_method"],
+                    data.get("notes", ""),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            return doc_id
 
     @classmethod
-    def update(cls, user_id: str, doc_id: str, data: Dict[str, Any]) -> None:
-        collection = cls._collection(user_id)
-        doc_ref = collection.document(doc_id)
-        if not doc_ref.get().exists:
-            raise FileNotFoundError(f"Expense {doc_id} does not exist.")
-        data["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        doc_ref.update(data)
+    def update(cls, user_id: str, expense_id: str, data: Dict[str, Any]) -> None:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE expenses
+                SET title = ?, amount = ?, currency = ?, category = ?,
+                    transaction_date = ?, payment_method = ?, notes = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    data["title"],
+                    float(data["amount"]),
+                    data["currency"],
+                    data["category"],
+                    data["transaction_date"],
+                    data["payment_method"],
+                    data.get("notes", ""),
+                    now,
+                    expense_id,
+                    user_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise FileNotFoundError(f"Expense {expense_id} not found for user {user_id}")
+            conn.commit()
 
     @classmethod
-    def delete(cls, user_id: str, doc_id: str) -> None:
-        collection = cls._collection(user_id)
-        doc_ref = collection.document(doc_id)
-        if not doc_ref.get().exists:
-            raise FileNotFoundError(f"Expense {doc_id} does not exist.")
-        doc_ref.delete()
+    def delete(cls, user_id: str, expense_id: str) -> None:
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM expenses WHERE id = ? AND user_id = ?",
+                (expense_id, user_id),
+            )
+            if cursor.rowcount == 0:
+                raise FileNotFoundError(f"Expense {expense_id} not found for user {user_id}")
+            conn.commit()
 
 
 # ==============================================================================
@@ -155,7 +205,7 @@ class FirestoreService:
 
 
 class GeminiAnalyticsService:
-    """Handles financial analysis generation using the official Google Gen AI SDK."""
+    """Generates spending insights via Google Gen AI SDK without sending PII."""
 
     @staticmethod
     def generate_spending_insights(
@@ -168,21 +218,21 @@ class GeminiAnalyticsService:
             return "AI Insights are disabled via configuration."
 
         if not GEMINI_API_KEY:
-            return "Gemini API key is not configured. Set GEMINI_API_KEY to enable insights."
+            return "Gemini API key is not configured. Set GEMINI_API_KEY in your environment or secrets."
 
         if expense_count == 0:
-            return "No transactions found to analyze. Please add some expenses first."
+            return "No transactions found. Add some expenses first to analyze your spending."
 
         try:
             from google import genai
 
             client = genai.Client(api_key=GEMINI_API_KEY)
 
-            # Sanitized aggregation prompt: no personal descriptions or notes are transmitted
+            # Strict privacy preservation: transmit only aggregated sums
             prompt = f"""
 You are an expert personal finance budgeting analyst.
 Review the following aggregated spending summary and generate 3 to 4 concise, actionable insights or recommendations.
-Keep the tone professional, encouraging, and clear. Note that this is automated guidance, not formal financial advice.
+Keep the tone encouraging, professional, and clear. Note that this is automated guidance, not formal financial advice.
 
 Summary Data:
 - Total Spending: {currency} {total_spent:,.2f}
@@ -190,7 +240,7 @@ Summary Data:
 - Category Breakdown:
 {json.dumps(category_breakdown, indent=2)}
 
-Format with markdown bullet points. Highlight key spending categories or areas of potential savings.
+Format with markdown bullet points. Highlight anomalies or dominant expense categories.
 """
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -203,12 +253,12 @@ Format with markdown bullet points. Highlight key spending categories or areas o
 
 
 # ==============================================================================
-# 4. SESSION STATE & CONTROLLER LOGIC
+# 4. CONTROLLER & STATE INITIALIZATION
 # ==============================================================================
 
 
-def init_session_state():
-    """Initializes persistent UI and editing states."""
+def init_session_state() -> None:
+    """Initializes Streamlit session state keys."""
     if "user_id" not in st.session_state:
         st.session_state.user_id = "default_user"
     if "editing_expense" not in st.session_state:
@@ -219,72 +269,67 @@ def init_session_state():
         st.session_state.ai_insights = ""
 
 
-def reset_edit_state():
+def reset_edit_state() -> None:
     st.session_state.editing_expense = None
 
 
 # ==============================================================================
-# 5. USER INTERFACE & PRESENTATION LAYER
+# 5. USER INTERFACE COMPONENTS
 # ==============================================================================
 
 
-def main():
+def main() -> None:
     st.set_page_config(
         page_title="Personal Expense Tracker",
-        page_icon="💳",
+        page_icon="💰",
         layout="wide",
     )
+
+    # Initialize SQLite Database
+    SQLiteDatabaseService.initialize_db()
     init_session_state()
 
-    st.title("💳 Personal Expense Tracker")
-    st.caption("Cloud-persisted budgeting powered by Google Gemini AI & Firebase Firestore")
+    st.title("💰 Personal Expense Tracker")
+    st.caption("Self-contained local budgeting engine powered by SQLite & Google Gemini AI")
 
-    # Verify Database connectivity early
-    db = get_firestore_client()
-    if db is None:
-        st.error(
-            "⚠️ Firebase is not connected. Please supply valid credentials in `.streamlit/secrets.toml` or environment variables."
-        )
-        st.stop()
-
-    # Load records for current user
+    # Fetch User Records
     try:
-        expenses = FirestoreService.get_all(st.session_state.user_id)
+        expenses = SQLiteDatabaseService.get_all(st.session_state.user_id)
     except Exception as e:
-        st.error(f"Failed to fetch records from Firestore: {e}")
+        st.error(f"Database read failure: {e}")
         expenses = []
 
-    # Calculate High-Level Metrics
-    total_spend = sum(float(e.get("amount", 0.0)) for e in expenses)
+    # KPI Metrics
+    total_spent = sum(float(e.get("amount", 0.0)) for e in expenses)
     total_tx = len(expenses)
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Total Spending", f"{DEFAULT_CURRENCY} {total_spend:,.2f}")
+    col1.metric("Total Spending", f"{DEFAULT_CURRENCY} {total_spent:,.2f}")
     col2.metric("Total Transactions", total_tx)
-    col3.metric("Configured Currency", DEFAULT_CURRENCY)
+    col3.metric("Currency", DEFAULT_CURRENCY)
 
     st.divider()
 
     # --------------------------------------------------------------------------
-    # Expense Form (Create / Edit)
+    # Expense Form (Create & Update)
     # --------------------------------------------------------------------------
     is_editing = st.session_state.editing_expense is not None
-    form_title = "✏️ Edit Expense" if is_editing else "➕ Add New Expense"
+    form_heading = "✏️ Edit Expense" if is_editing else "➕ Add New Expense"
     edit_data = st.session_state.editing_expense or {}
 
-    with st.expander(form_title, expanded=is_editing or total_tx == 0):
+    with st.expander(form_heading, expanded=is_editing or total_tx == 0):
         with st.form("expense_form", clear_on_submit=not is_editing):
             f_col1, f_col2, f_col3 = st.columns(3)
             with f_col1:
-                title_val = st.text_input(
+                title_input = st.text_input(
                     "Title / Description *",
                     value=edit_data.get("title", ""),
-                    placeholder="e.g. Office Lunch, Groceries",
+                    placeholder="e.g. Groceries or Fuel",
                 )
-                amt_val = st.text_input(
+                amount_input = st.text_input(
                     f"Amount ({DEFAULT_CURRENCY}) *",
                     value=str(edit_data.get("amount", "")),
-                    placeholder="e.g. 1500.00",
+                    placeholder="e.g. 1500.50",
                 )
             with f_col2:
                 default_cat_idx = (
@@ -292,7 +337,7 @@ def main():
                     if edit_data.get("category") in SUPPORTED_CATEGORIES
                     else 0
                 )
-                category_val = st.selectbox(
+                category_input = st.selectbox(
                     "Category *",
                     SUPPORTED_CATEGORIES,
                     index=default_cat_idx,
@@ -302,22 +347,22 @@ def main():
                     if "transaction_date" in edit_data
                     else datetime.date.today()
                 )
-                date_val = st.date_input("Transaction Date *", value=default_date)
+                date_input = st.date_input("Transaction Date *", value=default_date)
             with f_col3:
                 default_pm_idx = (
                     PAYMENT_METHODS.index(edit_data["payment_method"])
                     if edit_data.get("payment_method") in PAYMENT_METHODS
                     else 0
                 )
-                payment_val = st.selectbox(
+                pm_input = st.selectbox(
                     "Payment Method *",
                     PAYMENT_METHODS,
                     index=default_pm_idx,
                 )
-                notes_val = st.text_input(
+                notes_input = st.text_input(
                     "Optional Notes",
                     value=edit_data.get("notes", ""),
-                    placeholder="e.g. Team reimbursement pending",
+                    placeholder="e.g. Monthly utility bill",
                 )
 
             submit_label = "Update Expense" if is_editing else "Save Expense"
@@ -325,45 +370,46 @@ def main():
 
             if submitted:
                 # Validation: Title
-                if not title_val.strip():
-                    st.error("Title cannot be empty.")
+                clean_title = title_input.strip()
+                if not clean_title:
+                    st.error("Expense title cannot be empty.")
                     st.stop()
 
-                # Validation: Amount Decimal Safety
+                # Validation: Exact Numeric & Positive Check
                 try:
-                    dec_amt = Decimal(amt_val.strip())
+                    dec_amt = Decimal(amount_input.strip())
                     if dec_amt <= Decimal("0"):
-                        st.error("Amount must be greater than zero.")
+                        st.error("Expense amount must be strictly greater than zero.")
                         st.stop()
                 except (InvalidOperation, ValueError):
-                    st.error("Please enter a valid numeric amount.")
+                    st.error("Please provide a valid numeric amount.")
                     st.stop()
 
                 payload = {
-                    "title": title_val.strip(),
+                    "title": clean_title,
                     "amount": float(dec_amt),
                     "currency": DEFAULT_CURRENCY,
-                    "category": category_val,
-                    "transaction_date": date_val.isoformat(),
-                    "payment_method": payment_val,
-                    "notes": notes_val.strip(),
+                    "category": category_input,
+                    "transaction_date": date_input.isoformat(),
+                    "payment_method": pm_input,
+                    "notes": notes_input.strip(),
                 }
 
                 try:
                     if is_editing:
-                        FirestoreService.update(
+                        SQLiteDatabaseService.update(
                             st.session_state.user_id,
                             edit_data["id"],
                             payload,
                         )
-                        st.success("Expense updated successfully.")
+                        st.success("Expense successfully updated.")
                         reset_edit_state()
                     else:
-                        FirestoreService.create(st.session_state.user_id, payload)
-                        st.success("Expense recorded successfully.")
+                        SQLiteDatabaseService.create(st.session_state.user_id, payload)
+                        st.success("Expense saved.")
                     st.rerun()
                 except Exception as err:
-                    st.error(f"Database error: {err}")
+                    st.error(f"Persistence error: {err}")
 
         if is_editing:
             if st.button("Cancel Edit"):
@@ -371,86 +417,83 @@ def main():
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # Deletion Confirmation Dialog
+    # Delete Confirmation Dialog
     # --------------------------------------------------------------------------
     if st.session_state.pending_delete_id:
-        st.warning(f"⚠️ Are you sure you want to permanently delete this expense?")
-        del_col1, del_col2, _ = st.columns([1, 1, 4])
-        with del_col1:
+        st.warning("⚠️ Are you sure you want to permanently delete this expense?")
+        d_col1, d_col2, _ = st.columns([1, 1, 4])
+        with d_col1:
             if st.button("Yes, Delete", type="primary"):
                 try:
-                    FirestoreService.delete(
+                    SQLiteDatabaseService.delete(
                         st.session_state.user_id,
                         st.session_state.pending_delete_id,
                     )
                     st.session_state.pending_delete_id = None
-                    st.success("Record deleted successfully.")
+                    st.success("Expense deleted.")
                     st.rerun()
                 except Exception as ex:
-                    st.error(f"Failed to delete record: {ex}")
-        with del_col2:
+                    st.error(f"Deletion failed: {ex}")
+        with d_col2:
             if st.button("Cancel"):
                 st.session_state.pending_delete_id = None
                 st.rerun()
 
     # --------------------------------------------------------------------------
-    # Search, Filter, and Expense Table
+    # Search, Filters, and Expenses Display
     # --------------------------------------------------------------------------
     st.subheader("📑 Expense Records")
 
-    s_col1, s_col2, s_col3 = st.columns([2, 1, 1])
-    with s_col1:
-        search_kw = st.text_input("🔍 Search Title or Notes", placeholder="Filter by text...")
-    with s_col2:
-        filter_cat = st.selectbox("Category Filter", ["All"] + SUPPORTED_CATEGORIES)
-    with s_col3:
-        sort_choice = st.selectbox(
+    s1, s2, s3 = st.columns([2, 1, 1])
+    with s1:
+        query_text = st.text_input("🔍 Search Title or Notes", placeholder="Search...")
+    with s2:
+        selected_category = st.selectbox("Category Filter", ["All"] + SUPPORTED_CATEGORIES)
+    with s3:
+        sort_rule = st.selectbox(
             "Sort By",
             ["Date (Newest)", "Date (Oldest)", "Amount (Highest)", "Amount (Lowest)"],
         )
 
-    # Filter pipeline
-    display_expenses = list(expenses)
-    if filter_cat != "All":
-        display_expenses = [e for e in display_expenses if e.get("category") == filter_cat]
+    # Filter Pipeline
+    filtered = list(expenses)
+    if selected_category != "All":
+        filtered = [e for e in filtered if e.get("category") == selected_category]
 
-    if search_kw.strip():
-        kw = search_kw.strip().lower()
-        display_expenses = [
+    if query_text.strip():
+        kw = query_text.strip().lower()
+        filtered = [
             e
-            for e in display_expenses
+            for e in filtered
             if kw in str(e.get("title", "")).lower()
             or kw in str(e.get("notes", "")).lower()
         ]
 
-    if sort_choice == "Date (Newest)":
-        display_expenses.sort(key=lambda x: str(x.get("transaction_date", "")), reverse=True)
-    elif sort_choice == "Date (Oldest)":
-        display_expenses.sort(key=lambda x: str(x.get("transaction_date", "")))
-    elif sort_choice == "Amount (Highest)":
-        display_expenses.sort(key=lambda x: float(x.get("amount", 0.0)), reverse=True)
-    elif sort_choice == "Amount (Lowest)":
-        display_expenses.sort(key=lambda x: float(x.get("amount", 0.0)))
+    if sort_rule == "Date (Newest)":
+        filtered.sort(key=lambda x: str(x.get("transaction_date", "")), reverse=True)
+    elif sort_rule == "Date (Oldest)":
+        filtered.sort(key=lambda x: str(x.get("transaction_date", "")))
+    elif sort_rule == "Amount (Highest)":
+        filtered.sort(key=lambda x: float(x.get("amount", 0.0)), reverse=True)
+    elif sort_rule == "Amount (Lowest)":
+        filtered.sort(key=lambda x: float(x.get("amount", 0.0)))
 
-    if not display_expenses:
-        st.info("No expense transactions match the current view criteria.")
+    if not filtered:
+        st.info("No expense records match the specified filters.")
     else:
-        # Display Table with Action Columns
-        for item in display_expenses:
-            r_col1, r_col2, r_col3, r_col4, r_col5, r_col6 = st.columns(
-                [1.5, 3, 1.5, 2, 1, 1]
-            )
-            r_col1.write(f"📅 `{item.get('transaction_date')}`")
-            r_col2.write(f"**{item.get('title')}**\n*{item.get('notes') or '-'}*")
-            r_col3.caption(f"🏷️ {item.get('category')}")
-            r_col4.write(f"**{item.get('currency')} {float(item.get('amount', 0.0)):,.2f}**")
+        for item in filtered:
+            r1, r2, r3, r4, r5, r6 = st.columns([1.5, 3, 1.5, 2, 1, 1])
+            r1.write(f"📅 `{item.get('transaction_date')}`")
+            r2.write(f"**{item.get('title')}**\n*{item.get('notes') or '-'}*")
+            r3.caption(f"🏷️ {item.get('category')} ({item.get('payment_method')})")
+            r4.write(f"**{item.get('currency')} {float(item.get('amount', 0.0)):,.2f}**")
 
-            with r_col5:
+            with r5:
                 if st.button("Edit", key=f"edit_{item['id']}"):
                     st.session_state.editing_expense = item
                     st.rerun()
 
-            with r_col6:
+            with r6:
                 if st.button("Delete", key=f"del_{item['id']}"):
                     st.session_state.pending_delete_id = item["id"]
                     st.rerun()
@@ -460,23 +503,23 @@ def main():
     # AI Spending Analysis (Gemini)
     # --------------------------------------------------------------------------
     st.subheader("🤖 AI Spending Insights")
-    st.caption("Automated budget evaluation powered by Google Gemini.")
+    st.caption("Automated budgeting and categorization review powered by Google Gemini.")
 
     if st.button("Generate AI Insights", type="secondary"):
         if not expenses:
-            st.warning("Please record some expenses before generating spending insights.")
+            st.warning("Please record some expenses before requesting an AI review.")
         else:
-            with st.spinner("Analyzing spending distribution with Gemini..."):
-                cat_breakdown: Dict[str, float] = {}
+            with st.spinner("Analyzing spending breakdown with Gemini..."):
+                cat_summary: Dict[str, float] = {}
                 for exp in expenses:
                     c = exp.get("category", "Other")
                     val = float(exp.get("amount", 0.0))
-                    cat_breakdown[c] = cat_breakdown.get(c, 0.0) + val
+                    cat_summary[c] = cat_summary.get(c, 0.0) + val
 
                 insights = GeminiAnalyticsService.generate_spending_insights(
                     currency=DEFAULT_CURRENCY,
-                    total_spent=total_spend,
-                    category_breakdown=cat_breakdown,
+                    total_spent=total_spent,
+                    category_breakdown=cat_summary,
                     expense_count=len(expenses),
                 )
                 st.session_state.ai_insights = insights
@@ -484,7 +527,7 @@ def main():
     if st.session_state.ai_insights:
         st.markdown(
             f"""
-            <div style="background-color: #f0f2f6; padding: 16px; border-radius: 8px; border-left: 4px solid #6366f1;">
+            <div style="background-color: #f8fafc; padding: 16px; border-radius: 8px; border-left: 4px solid #3b82f6; color: #1e293b;">
             {st.session_state.ai_insights}
             </div>
             """,
